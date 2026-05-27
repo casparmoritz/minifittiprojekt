@@ -66,6 +66,8 @@ namespace csharp_webapi.Controllers
                     iban = k.Iban,
                     konto = k.Konto,
                     ermaessigung = ermaessigung,
+                    abonr = aktivesAbo?.Abonr,
+                    ermid = ermaessigung?.Ermid,
                     aktivesAbo = aktivesAbo != null ? new
                     {
                         kundenabonr = aktivesAbo.Kundenabonr,
@@ -124,6 +126,8 @@ namespace csharp_webapi.Controllers
                 iban = k.Iban,
                 konto = k.Konto,
                 ermaessigung = ermaessigung,
+                abonr = aktivesAbo?.Abonr,
+                ermid = ermaessigung?.Ermid,
                 aktivesAbo = aktivesAbo != null ? new
                 {
                     kundenabonr = aktivesAbo.Kundenabonr,
@@ -164,6 +168,59 @@ namespace csharp_webapi.Controllers
             _context.Kunden.Add(kunde);
             await _context.SaveChangesAsync();
 
+            // Falls ein Abo angegeben ist, weisen wir es dem neuen Kunden zu
+            if (kunde.Abonr.HasValue && kunde.Abonr.Value > 0)
+            {
+                var start = DateTime.UtcNow;
+                var end = start.AddYears(1);
+                var selectedAbo = await _context.Abos.FindAsync(kunde.Abonr.Value);
+                if (selectedAbo != null)
+                {
+                    int months = 12;
+                    if (!string.IsNullOrEmpty(selectedAbo.Laufzeit))
+                    {
+                        var parts = selectedAbo.Laufzeit.Split('-');
+                        if (parts.Length == 2 && int.TryParse(parts[0], out int y) && int.TryParse(parts[1], out int m))
+                        {
+                            months = y * 12 + m;
+                        }
+                    }
+                    end = start.AddMonths(months);
+                }
+                var kundenAbo = new TblKundenAbo
+                {
+                    Kundennr = kunde.Kundennr,
+                    Abonr = kunde.Abonr.Value,
+                    Startdatum = start,
+                    Enddatum = end,
+                    Status = "AKTIV"
+                };
+                _context.KundenAbos.Add(kundenAbo);
+                await _context.SaveChangesAsync();
+
+                // Falls auch eine Ermäßigung angegeben ist, erstellen wir direkt eine Abrechnung für den aktuellen Monat,
+                // damit der Discount im System registriert wird.
+                if (kunde.Ermid.HasValue && kunde.Ermid.Value > 0)
+                {
+                    var erm = await _context.Ermaessigte.FindAsync(kunde.Ermid.Value);
+                    decimal discountRate = erm?.Ermaessigungssatz ?? 0m;
+                    decimal originalPrice = selectedAbo?.Grundpreis ?? 0m;
+                    decimal finalPrice = originalPrice * (1m - discountRate);
+
+                    var abrechnung = new TblAbrechnung
+                    {
+                        Kundennr = kunde.Kundennr,
+                        Abonr = kunde.Abonr.Value,
+                        Ermid = kunde.Ermid.Value,
+                        Kundenabonr = kundenAbo.Kundenabonr,
+                        Rechnungsbetrag = finalPrice,
+                        Abrechnungsmonat = new DateTime(DateTime.UtcNow.Year, DateTime.UtcNow.Month, 1, 0, 0, 0, DateTimeKind.Utc)
+                    };
+                    _context.Abrechnungen.Add(abrechnung);
+                    await _context.SaveChangesAsync();
+                }
+            }
+
             // 201 Created mit Location-Header zurückgeben
             return CreatedAtAction(nameof(GetKunde), new { id = kunde.Kundennr }, kunde);
         }
@@ -191,6 +248,96 @@ namespace csharp_webapi.Controllers
             try
             {
                 await _context.SaveChangesAsync();
+
+                // 1. Subscription (Abo) aktualisieren/anlegen
+                TblKundenAbo? activeAbo = await _context.KundenAbos
+                    .FirstOrDefaultAsync(ka => ka.Kundennr == id && ka.Status == "AKTIV");
+
+                if (kunde.Abonr.HasValue && kunde.Abonr.Value > 0)
+                {
+                    if (activeAbo == null || activeAbo.Abonr != kunde.Abonr.Value)
+                    {
+                        if (activeAbo != null)
+                        {
+                            activeAbo.Status = "ABGELAUFEN";
+                            activeAbo.Enddatum = DateTime.UtcNow;
+                        }
+
+                        var start = DateTime.UtcNow;
+                        var end = start.AddYears(1);
+                        var selectedAbo = await _context.Abos.FindAsync(kunde.Abonr.Value);
+                        if (selectedAbo != null)
+                        {
+                            int months = 12;
+                            if (!string.IsNullOrEmpty(selectedAbo.Laufzeit))
+                            {
+                                var parts = selectedAbo.Laufzeit.Split('-');
+                                if (parts.Length == 2 && int.TryParse(parts[0], out int y) && int.TryParse(parts[1], out int m))
+                                {
+                                    months = y * 12 + m;
+                                }
+                            }
+                            end = start.AddMonths(months);
+                        }
+
+                        activeAbo = new TblKundenAbo
+                        {
+                            Kundennr = id,
+                            Abonr = kunde.Abonr.Value,
+                            Startdatum = start,
+                            Enddatum = end,
+                            Status = "AKTIV"
+                        };
+                        _context.KundenAbos.Add(activeAbo);
+                        await _context.SaveChangesAsync();
+                    }
+                }
+                else if (kunde.Abonr.HasValue && kunde.Abonr.Value == 0)
+                {
+                    // Abo explizit auf "Kein Abo" gesetzt
+                    if (activeAbo != null)
+                    {
+                        activeAbo.Status = "ABGELAUFEN";
+                        activeAbo.Enddatum = DateTime.UtcNow;
+                        await _context.SaveChangesAsync();
+                        activeAbo = null;
+                    }
+                }
+
+                // 2. Ermäßigung (Ermid) in der Abrechnung aktualisieren/anlegen
+                if (kunde.Ermid.HasValue && kunde.Ermid.Value > 0)
+                {
+                    var latestAbrechnung = await _context.Abrechnungen
+                        .Where(a => a.Kundennr == id)
+                        .OrderByDescending(a => a.Abrechnungsmonat)
+                        .FirstOrDefaultAsync();
+
+                    var erm = await _context.Ermaessigte.FindAsync(kunde.Ermid.Value);
+                    decimal discountRate = erm?.Ermaessigungssatz ?? 0m;
+
+                    if (latestAbrechnung != null)
+                    {
+                        latestAbrechnung.Ermid = kunde.Ermid.Value;
+                        var usedAbo = await _context.Abos.FindAsync(latestAbrechnung.Abonr);
+                        latestAbrechnung.Rechnungsbetrag = (usedAbo?.Grundpreis ?? 0m) * (1m - discountRate);
+                    }
+                    else
+                    {
+                        int targetAboNr = activeAbo?.Abonr ?? (kunde.Abonr.HasValue && kunde.Abonr.Value > 0 ? kunde.Abonr.Value : 1);
+                        var usedAbo = await _context.Abos.FindAsync(targetAboNr);
+                        var newAbrechnung = new TblAbrechnung
+                        {
+                            Kundennr = id,
+                            Abonr = targetAboNr,
+                            Ermid = kunde.Ermid.Value,
+                            Kundenabonr = activeAbo?.Kundenabonr,
+                            Rechnungsbetrag = (usedAbo?.Grundpreis ?? 0m) * (1m - discountRate),
+                            Abrechnungsmonat = new DateTime(DateTime.UtcNow.Year, DateTime.UtcNow.Month, 1, 0, 0, 0, DateTimeKind.Utc)
+                        };
+                        _context.Abrechnungen.Add(newAbrechnung);
+                    }
+                    await _context.SaveChangesAsync();
+                }
             }
             catch (DbUpdateConcurrencyException)
             {

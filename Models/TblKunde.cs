@@ -25,6 +25,12 @@ namespace csharp_webapi.Models
         [ForeignKey(nameof(Iban))]
         public TblKonto? Konto { get; set; }
 
+        [NotMapped]
+        public int? Abonr { get; set; }
+
+        [NotMapped]
+        public int? Ermid { get; set; }
+
         [JsonIgnore]
         public ICollection<TblAbrechnung> Abrechnungen { get; set; } = new List<TblAbrechnung>();
     }
